@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>던전 크루</title>
 <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Black+Han+Sans&family=Noto+Sans+KR:wght@400;500;700;900&display=swap" rel="stylesheet">
@@ -1336,69 +1337,149 @@ function newPeer(id){
     p.on('error',e=>{if(!done){done=true;clearTimeout(t);try{p.destroy();}catch(_){}rej(e);}});
   });
 }
+const MQ_BROKERS=['wss://broker.hivemq.com:8884/mqtt','wss://test.mosquitto.org:8081'];
+const MQ_ROOT='dungeoncrew/v1/';
+function mqConnect(url,opts){
+  return new Promise((res,rej)=>{
+    if(typeof mqtt==='undefined'){rej(new Error('nomqtt'));return;}
+    let done=false;
+    const c=mqtt.connect(url,Object.assign({connectTimeout:7000,reconnectPeriod:2000,clientId:'dc'+Math.random().toString(36).slice(2,12),clean:true},opts||{}));
+    c.on('connect',()=>{if(!done){done=true;res(c);}});
+    c.on('error',e=>{if(!done){done=true;try{c.end(true);}catch(_){}rej(e);}});
+    setTimeout(()=>{if(!done){done=true;try{c.end(true);}catch(_){}rej(new Error('timeout'));}},8000);
+  });
+}
+function mergePres(old,patch){const n=Object.assign({},old);for(const k in patch){if(patch[k]===null)delete n[k];else n[k]=patch[k];}return Object.freeze(n);}
 const NET={
-  available:()=>typeof Peer!=='undefined',
+  available:()=>typeof Peer!=='undefined'||typeof mqtt!=='undefined',
   async host(code){
-    const peer=await newPeer(PFX+code.toLowerCase());
-    const o=makeRoomObj(peer.id), conns=new Map();
+    const lc=code.toLowerCase();
+    let peer=null;
+    if(typeof Peer!=='undefined'){
+      try{peer=await newPeer(PFX+lc);}
+      catch(e){if(e&&e.type==='unavailable-id')throw e; peer=null;}
+    }
+    const selfId=peer?peer.id:PFX+lc;
+    const o=makeRoomObj(selfId), conns=new Map();
+    const mq=[];              // {c, url}
+    const mqClients=new Map();// id -> {last, b}
     let bt=null,lastB=0;
+    function stateMsg(){const others=[];for(const [id,v] of o.others)others.push([id,v]);return {t:'s',hid:o.selfId,h:o.selfPres,o:others};}
     function broadcast(){
-      bt=null;lastB=performance.now();
-      const others=[];for(const [id,v] of o.others)others.push([id,v]);
-      const msg={t:'s',hid:o.selfId,h:o.selfPres,o:others};
+      bt=null;const now=performance.now();lastB=now;
+      const msg=stateMsg();
       for(const c of conns.values()){if(c.open)try{c.send(msg);}catch(_){}}
     }
-    function sched(){if(bt)return;const wait=Math.max(0,33-(performance.now()-lastB));bt=setTimeout(broadcast,wait);}
-    peer.on('connection',c=>{
-      c.on('open',()=>{if(conns.size>=7){c.close();return;}conns.set(c.peer,c);o.others.set(c.peer,Object.freeze({}));o.rebuild();sched();});
-      c.on('data',d=>{
-        if(!d||d.t!=='p'||typeof d.p!=='object'||!d.p)return;
-        if(!conns.has(c.peer))return;
-        o.others.set(c.peer,Object.freeze(Object.assign({},d.p)));
-        o.rebuild();sched();
+    function mqSend(){
+      if(!mqClients.size)return;
+      const str=JSON.stringify(stateMsg());
+      const used=new Set();for(const v of mqClients.values())used.add(v.b);
+      for(const m of mq)if(used.has(m.url))try{m.c.publish(MQ_ROOT+lc+'/h',str,{qos:0});}catch(_){}
+    }
+    const mqTimer=setInterval(mqSend,100);   // 중계 손님에게는 초당 10번
+    function sched(){if(bt)return;bt=setTimeout(broadcast,Math.max(0,33-(performance.now()-lastB)));}
+    function dropClient(id){if(!o.others.has(id))return;o.others.delete(id);mqClients.delete(id);conns.delete(id);o.rebuild();sched();}
+    if(peer){
+      peer.on('connection',c=>{
+        c.on('open',()=>{if(o.others.size>=7){c.close();return;}conns.set(c.peer,c);o.others.set(c.peer,Object.freeze({}));o.rebuild();sched();});
+        c.on('data',d=>{if(!d||d.t!=='p'||typeof d.p!=='object'||!d.p||!conns.has(c.peer))return;o.others.set(c.peer,Object.freeze(Object.assign({},d.p)));o.rebuild();sched();});
+        const gone=()=>{if(conns.get(c.peer)===c)dropClient(c.peer);};
+        c.on('close',gone);c.on('error',gone);
       });
-      const gone=()=>{if(!conns.has(c.peer))return;conns.delete(c.peer);o.others.delete(c.peer);o.rebuild();sched();};
-      c.on('close',gone);c.on('error',gone);
-    });
-    peer.on('disconnected',()=>{o.setConn(false);try{peer.reconnect();}catch(_){}});
-    peer.on('open',()=>o.setConn(true));
-    o.api.presence=function(patch){
-      const n=Object.assign({},o.selfPres);
-      for(const k in patch){if(patch[k]===null)delete n[k];else n[k]=patch[k];}
-      o.selfPres=Object.freeze(n);o.rebuild();sched();return Promise.resolve();
-    };
-    o.api.leave=function(){o.closed=true;for(const c of conns.values())try{c.close();}catch(_){}try{peer.destroy();}catch(_){}return Promise.resolve();};
+      peer.on('disconnected',()=>{try{peer.reconnect();}catch(_){}});
+    }
+    // 중계 서버 (직접 연결이 안 되는 친구용)
+    for(const url of MQ_BROKERS){
+      mqConnect(url).then(c=>{
+        if(o.closed){try{c.end(true);}catch(_){}return;}
+        const m={c,url};mq.push(m);
+        c.subscribe(MQ_ROOT+lc+'/c',{qos:0});
+        c.on('message',(tp,buf)=>{
+          let d;try{d=JSON.parse(buf.toString());}catch(_){return;}
+          if(!d||typeof d.id!=='string'||d.id.length>60)return;
+          if(d.t==='bye'){if(mqClients.has(d.id))dropClient(d.id);return;}
+          if(d.t!=='p'||typeof d.p!=='object'||!d.p)return;
+          if(conns.has(d.id))return;
+          if(!o.others.has(d.id)&&o.others.size>=7)return;
+          mqClients.set(d.id,{last:performance.now(),b:url});
+          o.others.set(d.id,Object.freeze(Object.assign({},d.p)));o.rebuild();sched();
+        });
+      }).catch(()=>{});
+    }
+    const sweep=setInterval(()=>{const now=performance.now();for(const [id,v] of mqClients)if(now-v.last>7000)dropClient(id);},1000);
+    if(!peer&&!MQ_BROKERS.length)throw new Error('nonet');
+    o.api.presence=function(patch){o.selfPres=mergePres(o.selfPres,patch);o.rebuild();sched();return Promise.resolve();};
+    o.api.leave=function(){o.closed=true;clearInterval(sweep);clearInterval(mqTimer);for(const c of conns.values())try{c.close();}catch(_){}
+      if(peer)try{peer.destroy();}catch(_){}for(const m of mq)try{m.c.end(true);}catch(_){}return Promise.resolve();};
     return o.api;
   },
   async join(code){
-    const peer=await newPeer(null);
+    const lc=code.toLowerCase();
+    // 1) 직접 연결 시도
+    let direct=null, noRoom=false;
+    if(typeof Peer!=='undefined'){
+      try{
+        const peer=await newPeer(null);
+        direct=await new Promise((res)=>{
+          let done=false;
+          const c=peer.connect(PFX+lc,{serialization:'json'});
+          const t=setTimeout(()=>{if(!done){done=true;res(null);}},5500);
+          c.on('open',()=>{if(!done){done=true;clearTimeout(t);res({peer,c});}});
+          peer.on('error',e=>{if(!done){done=true;clearTimeout(t);if(e&&e.type==='peer-unavailable')noRoom=true;res(null);}});
+        });
+        if(!direct){try{peer.destroy();}catch(_){}}
+      }catch(_){direct=null;}
+    }
+    if(direct)return NET._joinDirect(direct.peer,direct.c);
+    if(noRoom)throw new Error('nohost');
+    // 2) 중계 서버로 연결
+    for(const url of MQ_BROKERS){
+      try{return await NET._joinRelay(lc,url);}catch(_){}
+    }
+    throw new Error('nohost');
+  },
+  _joinDirect(peer,conn){
     const o=makeRoomObj(peer.id);
-    const conn=await new Promise((res,rej)=>{
-      let done=false;
-      const c=peer.connect(PFX+code.toLowerCase(),{serialization:'json'});
-      const t=setTimeout(()=>{if(!done){done=true;rej(new Error('nohost'));}},9000);
-      c.on('open',()=>{if(!done){done=true;clearTimeout(t);res(c);}});
-      peer.on('error',e=>{if(!done){done=true;clearTimeout(t);rej(e);}});
-    }).catch(e=>{try{peer.destroy();}catch(_){}throw e;});
+    o.mode='direct';
     let pt=null,lastP=0;
     function sendPres(){pt=null;lastP=performance.now();if(conn.open)try{conn.send({t:'p',p:o.selfPres});}catch(_){}}
-    conn.on('data',d=>{
-      if(!d||d.t!=='s'||typeof d.h!=='object')return;
-      o.hostView={peer:String(d.hid),sameTab:false,isMe:false,kind:'viewer',guest:false,by:null,presence:Object.freeze(d.h)};
-      o.others=new Map();
-      if(Array.isArray(d.o))for(const [id,v] of d.o){if(id===o.selfId||typeof v!=='object'||!v)continue;o.others.set(String(id),Object.freeze(v));}
-      o.rebuild();
-    });
+    conn.on('data',d=>NET._onState(o,d));
     conn.on('close',()=>{o.hostView=null;o.others=new Map();o.setConn(false);o.rebuild();});
-    o.api.presence=function(patch){
-      const n=Object.assign({},o.selfPres);
-      for(const k in patch){if(patch[k]===null)delete n[k];else n[k]=patch[k];}
-      o.selfPres=Object.freeze(n);o.rebuild();
-      if(!pt)pt=setTimeout(sendPres,Math.max(0,33-(performance.now()-lastP)));
-      return Promise.resolve();
-    };
+    o.api.presence=function(patch){o.selfPres=mergePres(o.selfPres,patch);o.rebuild();if(!pt)pt=setTimeout(sendPres,Math.max(0,33-(performance.now()-lastP)));return Promise.resolve();};
     o.api.leave=function(){o.closed=true;try{conn.close();}catch(_){}try{peer.destroy();}catch(_){}return Promise.resolve();};
+    o.api.via='direct';
     return o.api;
+  },
+  async _joinRelay(lc,url){
+    const id='m'+Math.random().toString(36).slice(2,12);
+    const ctopic=MQ_ROOT+lc+'/c';
+    const c=await mqConnect(url,{will:{topic:ctopic,payload:JSON.stringify({t:'bye',id}),qos:0,retain:false}});
+    const o=makeRoomObj(id);
+    let got=false,lastGot=0;
+    c.subscribe(MQ_ROOT+lc+'/h',{qos:0});
+    c.on('message',(tp,buf)=>{let d;try{d=JSON.parse(buf.toString());}catch(_){return;}if(NET._onState(o,d)){got=true;lastGot=performance.now();}});
+    c.on('offline',()=>o.setConn(false));
+    c.on('connect',()=>o.setConn(true));
+    let pt=null,lastP=0;
+    function sendPres(){pt=null;lastP=performance.now();try{c.publish(ctopic,JSON.stringify({t:'p',id,p:o.selfPres}),{qos:0});}catch(_){}}
+    const keep=setInterval(()=>{sendPres();if(got&&o.hostView&&performance.now()-lastGot>4000){o.hostView=null;o.others=new Map();o.rebuild();}},1000);
+    sendPres();
+    // 방장이 응답하는지 확인
+    await new Promise((res,rej)=>{let k=0;const iv=setInterval(()=>{if(got){clearInterval(iv);res();}else if(++k>35){clearInterval(iv);rej(new Error('nohost'));}else if(k%5===0)sendPres();},200);})
+      .catch(e=>{clearInterval(keep);try{c.publish(ctopic,JSON.stringify({t:'bye',id}));c.end();}catch(_){}throw e;});
+    o.api.presence=function(patch){o.selfPres=mergePres(o.selfPres,patch);o.rebuild();if(!pt)pt=setTimeout(sendPres,Math.max(0,66-(performance.now()-lastP)));return Promise.resolve();};
+    o.api.leave=function(){o.closed=true;clearInterval(keep);try{c.publish(ctopic,JSON.stringify({t:'bye',id}),{qos:0},()=>{try{c.end();}catch(_){}});}catch(_){}return Promise.resolve();};
+    o.api.via='relay';
+    return o.api;
+  },
+  _onState(o,d){
+    if(!d||d.t!=='s'||typeof d.h!=='object'||!d.h)return false;
+    o.hostView={peer:String(d.hid),sameTab:false,isMe:false,kind:'viewer',guest:false,by:null,presence:Object.freeze(d.h)};
+    o.others=new Map();
+    if(Array.isArray(d.o))for(const [id,v] of d.o){if(id===o.selfId||typeof v!=='object'||!v)continue;o.others.set(String(id),Object.freeze(v));}
+    o.setConn(true);
+    o.rebuild();
+    return true;
   }
 };
 
@@ -1465,13 +1546,14 @@ async function joinRoom(){
   const c=($('code').value||'').toUpperCase().replace(/[^A-Z]/g,'');
   if(c.length!==4){note('방 코드 4글자를 입력해 주세요.',true);return;}
   if(!NET.available()){note('멀티 연결 라이브러리를 못 불러왔어요. 새로고침해 보세요.',true);return;}
-  note('방에 들어가는 중…');
+  note('방에 들어가는 중… (최대 15초 정도 걸릴 수 있어요)');
   try{R=await NET.join(c);}catch(e){note('방에 들어갈 수 없어요. 코드를 확인하거나, 방장이 아직 있는지 확인해 주세요.',true);return;}
   resetLocal(); mode='client'; code=c;
   enterRoomView(false);
   showRoomPart('lobby');
   $('slots').innerHTML='';$('lobCode').textContent=c;$('lobCtrl').innerHTML='';$('lobNote').textContent='방장을 찾는 중…';
   joinedAt=performance.now(); hostSeenAt=0;
+  pushChat('',R.via==='relay'?'중계 서버로 연결됐어요 (조금 느릴 수 있어요)':'방장과 직접 연결됐어요','',true);
   R.onPeers(onPeers,onRoomErr);
   R.onConnection(setConn,()=>{});
   clientPresence(true);
